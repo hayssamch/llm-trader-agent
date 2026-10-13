@@ -96,6 +96,34 @@ Run the tests (leakage guard, indicator shift, risk gates):
 PYTHONPATH=. python -m llm_trader.tests.test_pipeline
 ```
 
+## Daily signals to your phone (Telegram)
+
+A scheduled GitHub Action runs the agent once per trading day (22:00 UTC, after the
+US close) over the 11 assets and sends **one** Telegram digest: new BUYs with entry,
+stop-loss, target and the agent's reasoning (plus the chart it analysed), positions to
+close, and a short "no action" summary on quiet days. It **recommends only; it never
+places orders.**
+
+Because the system is long-only, it tracks *paper* positions so you are told to open a
+position once, told when to close it (stop, target or agent exit), and never re-told to
+buy something already held. Every decision is appended to `signals_log.csv` and every
+closed paper trade to `paper_trades.csv` on the `live-data` branch. That log is a genuine
+**forward test**: each decision is made before its outcome exists.
+
+**Setup** (once): create a bot with `@BotFather`, message it, find your chat id via
+`https://api.telegram.org/bot<TOKEN>/getUpdates`, then add four repository secrets
+(Settings -> Secrets and variables -> Actions): `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID`, `OPENAI_API_KEY` (an OpenRouter key) and `ALPHAVANTAGE_API_KEY`.
+
+**Test it:** Actions -> *Daily signals* -> *Run workflow*. The defaults are a safe test
+(free rule-based mode, marked "TEST RUN", nothing saved). Choose `ai` to test the LLM.
+Optional repository variable `LIVE_MODEL` changes the model (default `openai/gpt-4o-mini`).
+
+**Locally** (prints instead of sending): `python -m llm_trader.live.daily --mode rule --dry-run`
+
+The signal on a given close is what a backtest would decide for the *next* session
+(`as_of` = last bar + 1 day), so live behaviour matches the evaluated behaviour.
+
 ## Run modes
 
 | Flag           | Effect                                                        |

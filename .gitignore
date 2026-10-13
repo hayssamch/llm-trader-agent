@@ -5,3 +5,6 @@ data/charts/
 results/
 .env
 .streamlit/secrets.toml
+live_data/
+data/*_live/
+data/*_eval/

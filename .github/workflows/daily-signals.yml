@@ -1,0 +1,98 @@
+name: Daily signals
+
+# Runs the LLM Trader Agent once per trading day and sends the result to Telegram.
+# Recommendations only — it never places orders.
+on:
+  schedule:
+    - cron: "0 22 * * 1-5"      # 22:00 UTC Mon-Fri: after the US close in both EST and EDT
+  workflow_dispatch:            # the "Run workflow" button — defaults make it a safe TEST
+    inputs:
+      mode:
+        description: "Decision-maker (rule = free baseline, ai = the LLM agent)"
+        type: choice
+        options: [rule, ai]
+        default: rule
+      persist:
+        description: "Save positions and log (leave OFF for test runs)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-signals
+  cancel-in-progress: false
+
+permissions:
+  contents: write               # to push the live-data branch (never main)
+
+jobs:
+  signals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+      OPENAI_BASE_URL: https://openrouter.ai/api/v1
+      LIVE_MODEL: ${{ vars.LIVE_MODEL || 'openai/gpt-4o-mini' }}
+      # Scheduled runs are always the real thing (AI, saved); manual runs follow the inputs.
+      MODE: ${{ github.event_name == 'schedule' && 'ai' || inputs.mode }}
+      PERSIST: ${{ github.event_name == 'schedule' && 'true' || inputs.persist }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check configuration
+        id: cfg
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "::notice::Secrets are not configured in this repository - nothing to do."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=""
+          for v in TELEGRAM_CHAT_ID OPENAI_API_KEY ALPHAVANTAGE_API_KEY; do
+            if [ -z "${!v}" ]; then missing="$missing $v"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.enabled == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.cfg.outputs.enabled == 'true'
+        with:
+          python-version: "3.12"        # 3.14 breaks numba/pandas-ta
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          grep -vi '^streamlit' requirements.txt > "$RUNNER_TEMP/requirements-live.txt"
+          pip install -r "$RUNNER_TEMP/requirements-live.txt"
+
+      - name: Load saved state
+        if: steps.cfg.outputs.enabled == 'true'
+        run: bash .github/scripts/live_data.sh pull
+
+      - name: Run daily signals
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          ARGS="--mode $MODE"
+          if [ "$PERSIST" != "true" ]; then ARGS="$ARGS --no-persist --force"; fi
+          python -m llm_trader.live.daily $ARGS
+
+      - name: Save state
+        if: steps.cfg.outputs.enabled == 'true' && env.PERSIST == 'true'
+        run: bash .github/scripts/live_data.sh push
+
+      - name: Alert on failure
+        if: failure() && steps.cfg.outputs.enabled == 'true'
+        run: |
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=❌ Daily signals workflow FAILED - details: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > /dev/null || true
