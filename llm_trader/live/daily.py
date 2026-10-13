@@ -27,7 +27,7 @@ import json
 import logging
 import sys
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -54,9 +54,13 @@ UNIVERSE = {
 }
 SECRET_ENV = ("TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "ALPHAVANTAGE_API_KEY")
 APP_URL = os.environ.get("APP_URL", "https://llm-trading-agent.streamlit.app")
-LOG_FIELDS = ["run_utc", "ticker", "last_bar", "close", "action", "confidence",
-              "approved", "reject_reason", "event", "size_pct", "stop_loss",
-              "take_profit", "trend", "model", "rationale"]
+HORIZONS = (1, 5, 10, 20)           # trading days after the decision bar
+FWD_FIELDS = [f"fwd_{h}d" for h in HORIZONS]
+# Most useful columns first, the long rationale last. One row per
+# (last_bar, ticker, agent); the fwd_* columns fill in as prices arrive.
+LOG_FIELDS = ["last_bar", "ticker", "agent", "action", "confidence", "approved",
+              "event", "close", "size_pct", "stop_loss", "take_profit"] + FWD_FIELDS +              ["reject_reason", "trend", "model", "run_utc", "rationale"]
+LOG_KEY = ("last_bar", "ticker", "agent")
 TRADE_FIELDS = ["ticker", "entry_date", "entry_price", "exit_date", "exit_price",
                 "pnl_pct", "reason", "model"]
 
@@ -98,6 +102,7 @@ class Candidate:
     close:      float
     decision:   AgentDecision
     chart_path: str
+    rule_decision: Optional[AgentDecision] = None   # free baseline, logged alongside the AI
 
 
 # ── data / analysis ──────────────────────────────────────────────────────────
@@ -113,13 +118,21 @@ def drop_partial_bar(full: pd.DataFrame, now_utc: datetime) -> pd.DataFrame:
 
 
 def analyse_ticker(ticker: str, cfg: AgentConfig, agent: ChartReadingAgent,
-                   state: LiveState, now_utc: datetime,
-                   force: bool = False) -> Optional[Candidate]:
-    """Returns a Candidate, or None when there is no new bar since the last run."""
+                   state: LiveState, now_utc: datetime, force: bool = False,
+                   rule_agent: Optional[ChartReadingAgent] = None,
+                   series_out: Optional[Dict[str, pd.Series]] = None) -> Optional[Candidate]:
+    """Returns a Candidate, or None when there is no new bar since the last run.
+
+    rule_agent: when given (AI mode), the free rule-based decision for the same bar is
+                computed too, so both decision-makers are judged on identical days.
+    series_out: receives the asset's closing prices (used later to fill in outcomes,
+                including for assets that have no new bar today)."""
     fetcher = DataFetcher(cfg)
     full = drop_partial_bar(fetcher.fetch(ticker), now_utc)
     if full.empty:
         raise ValueError("no price data returned")
+    if series_out is not None:
+        series_out[ticker] = full["Close"].astype(float)
     newest = full.index[-1]
     last_bar = newest.strftime("%Y-%m-%d")
     if (now_utc.date() - newest.date()).days > 6:
@@ -139,7 +152,12 @@ def analyse_ticker(ticker: str, cfg: AgentConfig, agent: ChartReadingAgent,
     decision = agent.analyze(image_b64, executor, ticker, as_of)
     if not decision.raw:      # the parser falls back to HOLD on bad JSON — not a real decision
         raise ValueError("AI response could not be parsed (treated as a failure, not a HOLD)")
-    return Candidate(ticker, last_bar, float(window["Close"].iloc[-1]), decision, chart_path)
+    rule_decision = None
+    if rule_agent is not None:        # separate executor so tool audit trails stay separate
+        rule_decision = rule_agent.analyze(
+            image_b64, ToolExecutor(window, ticker, as_of, cfg), ticker, as_of)
+    return Candidate(ticker, last_bar, float(window["Close"].iloc[-1]), decision,
+                     chart_path, rule_decision)
 
 
 # ── portfolio logic (pure: easy to test) ─────────────────────────────────────
@@ -156,8 +174,12 @@ def _close_position(state, c, reason, model, events, closed):
 
 
 def process(candidates: List[Candidate], state: LiveState, risk: RiskFilter,
-            run_utc: str, model: str):
-    """Apply exits, then agent signals (most confident first). Mutates `state`."""
+            run_utc: str, model: str, agent: str = "ai"):
+    """Apply exits, then agent signals (most confident first). Mutates `state`.
+
+    Returns (events, rows, closed). `rows` holds one audit row per decision. The
+    primary agent's rows carry an `event`; the free rule-based baseline rows (AI mode
+    only) are logged for comparison, have event "" and never touch positions."""
     events, rows, closed = [], [], []
     event_of: Dict[str, str] = {}
 
@@ -200,18 +222,30 @@ def process(candidates: List[Candidate], state: LiveState, risk: RiskFilter,
             else:
                 event_of.setdefault(c.ticker, "FLAT")      # long-only: nothing to sell
 
-    for c in candidates:                                   # 3) full audit log
-        d, sig = c.decision, sigs[c.ticker]
-        rows.append({
+    def log_row(c, d, sig, who, event, mdl):
+        return {
             "run_utc": run_utc, "ticker": c.ticker, "last_bar": c.last_bar,
-            "close": round(c.close, 4), "action": d.action,
+            "agent": who, "close": round(c.close, 4), "action": d.action,
             "confidence": round(d.confidence, 3), "approved": sig.approved,
-            "reject_reason": sig.reject_reason, "event": event_of.get(c.ticker, "NONE"),
+            "reject_reason": sig.reject_reason, "event": event,
             "size_pct": round(sig.size_pct, 4), "stop_loss": round(sig.stop_loss, 4),
             "take_profit": round(sig.take_profit, 4) if sig.take_profit else "",
-            "trend": d.trend, "model": model,
-            "rationale": " ".join((d.rationale or "").split())})
+            "trend": d.trend, "model": mdl,
+            "rationale": " ".join((d.rationale or "").split())}
+
+    for c in candidates:                                   # 3) full audit log
+        rows.append(log_row(c, c.decision, sigs[c.ticker], agent,
+                            event_of.get(c.ticker, "NONE"), model))
+    for c in candidates:                                   # 4) baseline, for comparison only
+        if c.rule_decision is not None:
+            rsig = risk.filter(c.rule_decision, c.close, 0.0, 0)
+            rows.append(log_row(c, c.rule_decision, rsig, "rule", "", "rule-based"))
     return events, rows, closed
+
+
+def primary_rows(rows):
+    """The rows behind alerts (baseline comparison rows have an empty event)."""
+    return [r for r in rows if r["event"]]
 
 
 # ── message formatting ───────────────────────────────────────────────────────
@@ -231,6 +265,7 @@ def _short(text: str, n: int = 280) -> str:
 def format_digest(events, rows, skipped, failures, state, closes, mode_label,
                   persist: bool) -> str:
     esc = html.escape
+    rows = primary_rows(rows)
     bars = sorted({r["last_bar"] for r in rows})
     head = (f"📊 <b>Daily signals — closes of {_day(bars[-1])}</b>" if bars
             else "📊 <b>Daily signals</b>")
@@ -295,10 +330,56 @@ def _append_csv(path: str, fields: List[str], rows: List[dict]) -> None:
         w.writerows(rows)
 
 
-def persist(out_dir: str, state: LiveState, rows, closed) -> None:
+def forward_returns(series: pd.Series, last_bar: str) -> Dict[str, float]:
+    """% change of the close h trading days after `last_bar`, relative to the close of
+    `last_bar`. Only horizons that have already happened are returned."""
+    days = list(series.index.strftime("%Y-%m-%d"))
+    if last_bar not in days:
+        return {}
+    pos = days.index(last_bar)
+    base = float(series.iloc[pos])
+    return {f"fwd_{h}d": round((float(series.iloc[pos + h]) / base - 1) * 100, 3)
+            for h in HORIZONS if pos + h < len(series)}
+
+
+def _read_log(path: str) -> List[dict]:
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as fh:
+        return [{k: row.get(k, "") or "" for k in LOG_FIELDS} for row in csv.DictReader(fh)]
+
+
+def update_log(path: str, new_rows: List[dict],
+               series: Optional[Dict[str, pd.Series]] = None) -> None:
+    """Merge today's rows into the log (a row is identified by last_bar+ticker+agent, so
+    re-running a day replaces rather than duplicates) and fill in any outcome columns
+    that have become known. Outcomes are what let you ASSESS a past decision."""
+    merged: Dict[tuple, dict] = {tuple(r[k] for k in LOG_KEY): r for r in _read_log(path)}
+    for r in new_rows:
+        row = {k: r.get(k, "") for k in LOG_FIELDS}
+        if isinstance(row["approved"], bool):          # TRUE/FALSE is what Sheets parses
+            row["approved"] = "TRUE" if row["approved"] else "FALSE"
+        merged[tuple(row[k] for k in LOG_KEY)] = row
+    for row in merged.values():
+        ser = (series or {}).get(row["ticker"])
+        if ser is None:
+            continue
+        for col, val in forward_returns(ser, row["last_bar"]).items():
+            if row[col] == "":
+                row[col] = val
+    if not merged:
+        return
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=LOG_FIELDS)
+        w.writeheader()
+        w.writerows(merged.values())
+
+
+def persist(out_dir: str, state: LiveState, rows, closed,
+            series: Optional[Dict[str, pd.Series]] = None) -> None:
     os.makedirs(out_dir, exist_ok=True)
     state.save(os.path.join(out_dir, "state.json"))
-    _append_csv(os.path.join(out_dir, "signals_log.csv"), LOG_FIELDS, rows)
+    update_log(os.path.join(out_dir, "signals_log.csv"), rows, series)
     _append_csv(os.path.join(out_dir, "paper_trades.csv"), TRADE_FIELDS, closed)
 
 
@@ -319,11 +400,16 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
         cache_dir="./data/cache_live", chart_dir="./data/charts_live")
     state = LiveState.load(os.path.join(args.out_dir, "state.json"))
     agent, risk = ChartReadingAgent(cfg), RiskFilter(cfg)
+    # In AI mode the free rule-based decision is computed on the same bars as well, so
+    # both decision-makers can be compared on identical days (forward test).
+    rule_agent = ChartReadingAgent(replace(cfg, use_mock_llm=True)) if ai else None
+    series: Dict[str, pd.Series] = {}
 
     candidates, skipped, failures = [], [], {}
     for t in tickers:
         try:
-            c = analyse_ticker(t, cfg, agent, state, now_utc, force=args.force)
+            c = analyse_ticker(t, cfg, agent, state, now_utc, force=args.force,
+                               rule_agent=rule_agent, series_out=series)
             (skipped.append(t) if c is None else candidates.append(c))
         except Exception as exc:                           # one asset must not kill the run
             failures[t] = scrub(f"{type(exc).__name__}: {exc}")[:200]
@@ -331,12 +417,13 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
 
     run_utc = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
     events, rows, closed = process(candidates, state, risk, run_utc,
-                                   args.model if ai else "rule-based")
+                                   args.model if ai else "rule-based",
+                                   agent="ai" if ai else "rule")
     for c in candidates:
         state.last_bar[c.ticker] = c.last_bar
     do_persist = not args.no_persist
     if do_persist:
-        persist(args.out_dir, state, rows, closed)
+        persist(args.out_dir, state, rows, closed, series)
 
     label = f"AI · {args.model}" if ai else "rule-based EMA/RSI baseline"
     text = format_digest(events, rows, skipped, failures, state,

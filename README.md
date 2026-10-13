@@ -124,6 +124,38 @@ Optional repository variable `LIVE_MODEL` changes the model (default `openai/gpt
 The signal on a given close is what a backtest would decide for the *next* session
 (`as_of` = last bar + 1 day), so live behaviour matches the evaluated behaviour.
 
+### Reviewing decisions in Google Sheets
+
+The log is a plain CSV on the `live-data` branch, so a Google Sheet can show it live with
+one formula (no credentials; the repo is public, so the log is public too). In a new
+Sheet, rename the first tab `Log` and put this in cell `A1`:
+
+```
+=IMPORTDATA("https://raw.githubusercontent.com/hayssamch/llm-trader-agent/live-data/signals_log.csv")
+```
+
+Google refreshes it about hourly. One row per decision: the **AI** (`agent = ai`) and the
+free **rule-based baseline** (`agent = rule`) are logged on the same bars, so they are judged
+on identical days. Columns: `last_bar, ticker, agent, action, confidence, approved, event,
+close, size_pct, stop_loss, take_profit, fwd_1d, fwd_5d, fwd_10d, fwd_20d, reject_reason,
+trend, model, run_utc, rationale`.
+
+`fwd_Nd` is the % change of the close N trading days after the decision bar, measured from
+that bar's close. It is blank until N days have passed and is filled in by later runs, which
+is what lets you assess a past decision. Read it as "what the market did next", not as a
+backtested trade result (see `paper_trades.csv` for closed paper trades).
+
+A second tab (`Review`) with a start date in `B1` and an end date in `B2` can then compute,
+per asset and agent, how BUY recommendations fared (column M = 5-day, O = 20-day):
+
+```
+=QUERY(Log!A:T, "select B, C, count(D), avg(M), avg(O) where D = 'BUY' and M is not null and A >= date '"&TEXT($B$1,"yyyy-mm-dd")&"' and A <= date '"&TEXT($B$2,"yyyy-mm-dd")&"' group by B, C order by B, C label count(D) 'BUYs', avg(M) 'avg 5d %', avg(O) 'avg 20d %'", 1)
+```
+
+Always compare against the benchmark: the average `fwd_5d` of **all** `agent = ai` rows in
+the same period is what a random pick would have earned. A BUY average only means something
+if it beats that. Expect few BUY rows per month, so treat early numbers as anecdotes.
+
 ## Run modes
 
 | Flag           | Effect                                                        |
