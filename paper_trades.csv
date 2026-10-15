@@ -1,0 +1,2 @@
+ticker,entry_date,entry_price,exit_date,exit_price,pnl_pct,reason,model
+XOM,2026-10-12,172.15,2026-10-15,174.68,1.47,signal,openai/gpt-4o-mini
