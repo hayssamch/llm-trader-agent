@@ -35,6 +35,7 @@ from llm_trader.backtest.evaluator import Evaluator
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.WARNING)
 
+FIXED_SIZE = 0.05        # both agents trade this size, so only the decisions differ
 START, END = "2025-10-01", "2026-07-28"
 MODEL  = os.environ.get("EVAL_MODEL", "openai/gpt-4o-mini")
 ASSETS = {"AAPL": "Apple", "MSFT": "Microsoft"}   # keep short — costs money
@@ -48,6 +49,7 @@ def run(ticker: str, use_mock: bool):
     cfg = AgentConfig(
         tickers=[ticker], start_date=START, end_date=END,
         use_mock_llm=use_mock, use_synthetic=False, agent_model=MODEL,
+        fixed_size_pct=FIXED_SIZE,
         cache_dir="./data/cache_eval", chart_dir="./data/charts_eval",
     )
     engine = BacktestEngine(cfg)

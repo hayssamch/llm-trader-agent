@@ -64,7 +64,8 @@ except Exception:
     pass  # no secrets file configured (e.g. local run) — fine
 
 
-def build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model):
+def build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model,
+                 same_size=True):
     m = MODES[mode_key]
     return AgentConfig(
         tickers=[ticker],
@@ -72,6 +73,7 @@ def build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model
         end_date=end.strftime("%Y-%m-%d"),
         initial_capital=float(capital),
         max_position_pct=max_pos / 100.0,
+        fixed_size_pct=(max_pos / 100.0) if same_size else None,
         min_confidence=min_conf,
         agent_model=model,
         use_mock_llm=m["use_mock_llm"],
@@ -103,8 +105,13 @@ end   = col_b.date_input("End",   value=_end_default)
 
 st.sidebar.markdown("**Portfolio & risk**")
 capital  = st.sidebar.number_input("Initial capital ($)", 1_000, 10_000_000, 100_000, step=1_000)
-max_pos  = st.sidebar.slider("Max position size (%)", 1, 50, 10)
+max_pos  = st.sidebar.slider("Position size (%)", 1, 50, 5)
 min_conf = st.sidebar.slider("Min confidence to trade", 0.0, 1.0, 0.6, 0.05)
+same_size = st.sidebar.checkbox(
+    "Same size for every trade", value=True,
+    help="On: every trade, by the AI and the rule alike, uses exactly the position size "
+         "above, so comparing them reflects the decisions and not the size. "
+         "Off: the AI picks its own size, up to the position size above.")
 
 model = "gpt-4o"
 if MODES[mode_key]["use_mock_llm"] is False:
@@ -139,7 +146,7 @@ with tab_run:
     run = st.button("▶ Run backtest", type="primary", use_container_width=True)
 
     if run:
-        cfg = build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model)
+        cfg = build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model, same_size)
         try:
             with st.spinner(f"Running the agent over {ticker}… "
                             f"({'instant' if cfg.use_synthetic else 'fetching real data'})"):
@@ -244,7 +251,7 @@ with tab_inspect:
     go = st.button("🔍 Analyse this date", type="primary")
 
     if go:
-        cfg = build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model)
+        cfg = build_config(mode_key, ticker, start, end, capital, max_pos, min_conf, model, same_size)
         as_of = insp_date.strftime("%Y-%m-%d")
         try:
             with st.spinner("Rendering chart and running the agent…"):

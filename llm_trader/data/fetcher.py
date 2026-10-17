@@ -21,6 +21,10 @@ class DataFetcher:
     def __init__(self, config: AgentConfig = DEFAULT_CONFIG):
         self.config = config
         os.makedirs(config.cache_dir, exist_ok=True)
+        # Where the prices of the most recent fetch() came from: "yfinance",
+        # "alphavantage", "cache" or "synthetic". Yahoo (adjusted prices) and Alpha Vantage
+        # (unadjusted) can differ slightly, so the live log records which one was used.
+        self.last_source = "unknown"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public API
@@ -39,11 +43,13 @@ class DataFetcher:
         interval = interval or self.config.interval
 
         if self.config.use_synthetic:
+            self.last_source = "synthetic"
             return self._synthetic(ticker, start, end)
 
         cache_path = self._cache_path(ticker, start, end, interval)
         if not force and os.path.exists(cache_path):
             logger.debug("Cache hit: %s", cache_path)
+            self.last_source = "cache"
             return self._ensure_utc(pd.read_parquet(cache_path))
 
         logger.info("Downloading %s (%s → %s, %s)", ticker, start, end, interval)
@@ -69,13 +75,17 @@ class DataFetcher:
 
     def _download(self, ticker, start, end, interval) -> pd.DataFrame:
         try:
-            return self._download_yfinance(ticker, start, end, interval)
+            df = self._download_yfinance(ticker, start, end, interval)
+            self.last_source = "yfinance"
+            return df
         except Exception as exc:
             av_key = os.environ.get("ALPHAVANTAGE_API_KEY")
             if av_key and interval == "1d":
                 logger.warning("yfinance failed for %s (%s) — trying Alpha Vantage",
                                ticker, exc)
-                return self._download_alphavantage(ticker, start, end, av_key)
+                df = self._download_alphavantage(ticker, start, end, av_key)
+                self.last_source = "alphavantage"
+                return df
             raise ValueError(
                 f"No data for {ticker} ({start} → {end}). yfinance failed ({exc}). "
                 f"On cloud hosts Yahoo often rate-limits; set ALPHAVANTAGE_API_KEY "

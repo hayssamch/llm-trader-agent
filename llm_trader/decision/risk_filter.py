@@ -24,7 +24,9 @@ class RiskFilter:
     ) -> TradeSignal:
         action = Action(decision.action)
         conf   = decision.confidence
-        size   = min(decision.size_pct, self.cfg.max_position_pct)
+        proposed = (self.cfg.fixed_size_pct if self.cfg.fixed_size_pct is not None
+                    else decision.size_pct)
+        size   = min(proposed, self.cfg.max_position_pct)
         sl_pct = max(decision.stop_loss_pct, 0.02)
         tp_pct = decision.take_profit_pct
 

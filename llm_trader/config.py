@@ -11,7 +11,7 @@ Sentiment / fundamentals parameters have been removed from the active
 pipeline and are deferred to future work (see thesis Chapter 9).
 """
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -56,6 +56,11 @@ class AgentConfig:
 
     # ── Risk filter ───────────────────────────────────────────────────────────
     max_position_pct: float = 0.10
+    # When set, EVERY trade uses this size, for the AI and the rule alike (still capped by
+    # max_position_pct). Position size then becomes a portfolio policy rather than part of
+    # the agent's judgment, so an AI-vs-rule comparison isolates the BUY/SELL/HOLD decisions.
+    # None (default) keeps the old behaviour: the agent proposes its own size.
+    fixed_size_pct:   Optional[float] = None
     stop_loss_pct:    float = 0.05
     max_open_trades:  int = 3
     min_confidence:   float = 0.6

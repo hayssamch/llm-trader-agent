@@ -5,7 +5,8 @@ Run:  PYTHONPATH=. python -m pytest llm_trader/tests/test_live.py -v
 """
 import argparse
 import csv
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import pytest
@@ -14,9 +15,11 @@ from llm_trader.config import AgentConfig
 from llm_trader.decision.risk_filter import RiskFilter
 from llm_trader.models import AgentDecision
 from llm_trader.live import daily
+from llm_trader.data.fetcher import DataFetcher
 from llm_trader.live.daily import (Candidate, LiveState, LOG_FIELDS, _read_log,
-                                   analyse_ticker, drop_partial_bar, format_digest,
-                                   forward_returns, process, scrub, update_log)
+                                   analyse_ticker, days_behind, drop_partial_bar,
+                                   expected_last_bar, format_digest, forward_returns,
+                                   process, scrub, update_log)
 from llm_trader.live.notifier import NotifyError, TelegramNotifier
 
 
@@ -275,3 +278,108 @@ def test_end_to_end_run_saves_ai_and_baseline_rows_and_dedupes(tmp_path, monkeyp
     # same day again: nothing new to analyse, nothing duplicated
     assert daily.run(args, TelegramNotifier(dry_run=True)) == 0
     assert len(_read_log(str(tmp_path / "live" / "signals_log.csv"))) == 4
+
+
+# -- one size policy for both agents (fair comparison) -----------------------
+def _size_of(cfg, proposed):
+    d = replace(decision(), size_pct=proposed)
+    return RiskFilter(cfg).filter(d, 100.0).size_pct
+
+
+def test_fixed_size_overrides_whatever_the_agent_proposes():
+    cfg = AgentConfig(fixed_size_pct=0.05, max_position_pct=0.10)
+    assert _size_of(cfg, 0.10) == 0.05          # an ambitious agent is brought down
+    assert _size_of(cfg, 0.02) == 0.05          # a timid one is brought up: same size for all
+
+
+def test_fixed_size_is_still_capped_and_default_is_unchanged():
+    assert _size_of(AgentConfig(fixed_size_pct=0.20, max_position_pct=0.10), 0.05) == 0.10
+    plain = AgentConfig(max_position_pct=0.10)   # fixed_size_pct=None: agent decides, as before
+    assert _size_of(plain, 0.07) == 0.07 and _size_of(plain, 0.15) == 0.10
+
+
+# -- is the price data current? -----------------------------------------------
+UTC = timezone.utc
+
+
+def test_expected_last_bar_handles_evenings_mornings_and_weekends():
+    assert expected_last_bar(datetime(2026, 10, 14, 0, 42, tzinfo=UTC)) == date(2026, 10, 13)  # Tue 20:42 ET
+    assert expected_last_bar(datetime(2026, 10, 13, 15, 0, tzinfo=UTC)) == date(2026, 10, 12)  # Tue 11:00 ET, market open
+    assert expected_last_bar(datetime(2026, 10, 19, 9, 0, tzinfo=UTC)) == date(2026, 10, 16)   # Mon 05:00 ET
+    assert expected_last_bar(datetime(2026, 10, 17, 12, 0, tzinfo=UTC)) == date(2026, 10, 16)  # Saturday
+
+
+def test_days_behind_counts_trading_days_only():
+    assert days_behind(date(2026, 10, 12), date(2026, 10, 13)) == 1
+    assert days_behind(date(2026, 10, 16), date(2026, 10, 19)) == 1      # Fri -> Mon is one trading day
+    assert days_behind(date(2026, 10, 15), date(2026, 10, 19)) == 2
+    assert days_behind(date(2026, 10, 19), date(2026, 10, 19)) == 0
+    assert days_behind(date(2026, 10, 20), date(2026, 10, 19)) == 0
+
+
+def test_digest_puts_the_data_lag_warning_first():
+    text = format_digest([], [], [], {}, LiveState(), {}, "AI", persist=True,
+                         lag_note="Price data is 1 trading day behind for all 11 assets.")
+    assert "Price data is 1 trading day behind" in text
+    assert text.index("behind") < text.index("No action today")
+
+
+def test_fetcher_records_where_prices_came_from(tmp_path):
+    f = DataFetcher(synth_cfg(tmp_path))
+    f.fetch("AAPL")
+    assert f.last_source == "synthetic"
+
+
+class Recorder:
+    """Stands in for the Telegram notifier and keeps what would have been sent."""
+    def __init__(self):
+        self.messages = []
+
+    def send(self, text, silent=False):
+        self.messages.append(text)
+
+    def send_photo(self, *a, **k):
+        pass
+
+
+def _args(tmp_path, **over):
+    base = dict(mode="ai", model="m", tickers="AAPL,MSFT", out_dir=str(tmp_path / "live"),
+                dry_run=True, no_persist=False, force=False, synthetic=True, size_pct="0.05")
+    base.update(over)
+    return argparse.Namespace(**base)
+
+
+def _fake_ai(monkeypatch):
+    real = daily.ChartReadingAgent
+    monkeypatch.setattr(daily, "ChartReadingAgent",
+                        lambda cfg: FakeAgent({"ok": 1}) if not cfg.use_mock_llm else real(cfg))
+
+
+def test_run_logs_source_and_size_and_stays_quiet_when_nothing_is_new(tmp_path, monkeypatch):
+    _fake_ai(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    rec, args = Recorder(), _args(tmp_path)
+    assert daily.run(args, rec) == 0
+    rows = _read_log(str(tmp_path / "live" / "signals_log.csv"))
+    assert {r["data_source"] for r in rows} == {"synthetic"}
+    assert {float(r["size_pct"]) for r in rows} == {0.05}        # one size for both agents
+    assert len(rec.messages) == 1
+    assert daily.run(args, rec) == 0                              # same bar again
+    assert len(rec.messages) == 1                                 # nothing new: no second message
+    with open(tmp_path / "live" / "runs_log.csv", newline="", encoding="utf-8") as fh:
+        runs = list(csv.DictReader(fh))
+    assert [r["analysed"] for r in runs] == ["2", "0"] and runs[0]["sources"] == "synthetic:2"
+    assert runs[1]["skipped"] == "2" and runs[0]["size_policy"] == "fixed 5%"
+
+
+def test_data_lag_is_reported_even_when_nothing_is_new(tmp_path, monkeypatch):
+    _fake_ai(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    rec, args = Recorder(), _args(tmp_path)
+    daily.run(args, rec)
+    monkeypatch.setattr(daily, "expected_last_bar", lambda now: date(2099, 1, 5))
+    n = len(rec.messages)
+    daily.run(args, rec)                                          # nothing new, but data is behind
+    assert len(rec.messages) == n + 1 and "behind" in rec.messages[-1]
+    with open(tmp_path / "live" / "runs_log.csv", newline="", encoding="utf-8") as fh:
+        assert int(list(csv.DictReader(fh))[-1]["days_behind"]) > 0

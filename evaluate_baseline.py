@@ -19,6 +19,7 @@ from llm_trader.backtest.evaluator import Evaluator
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.WARNING)
 
+FIXED_SIZE = 0.05        # same size for every trade, as in the live job
 START, END = "2025-10-01", "2026-07-28"
 ASSETS = {
     "AAPL": "Apple",
@@ -36,6 +37,7 @@ for ticker, name in ASSETS.items():
     cfg = AgentConfig(
         tickers=[ticker], start_date=START, end_date=END,
         use_mock_llm=True,      # rule-based baseline (no LLM, no API cost)
+        fixed_size_pct=FIXED_SIZE,
         use_synthetic=False,    # REAL market data
         cache_dir="./data/cache_eval",
         chart_dir="./data/charts_eval",

@@ -28,10 +28,12 @@ import logging
 import sys
 import warnings
 from dataclasses import dataclass, field, replace
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from collections import Counter
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from llm_trader.config import AgentConfig
@@ -58,11 +60,16 @@ HORIZONS = (1, 5, 10, 20)           # trading days after the decision bar
 FWD_FIELDS = [f"fwd_{h}d" for h in HORIZONS]
 # Most useful columns first, the long rationale last. One row per
 # (last_bar, ticker, agent); the fwd_* columns fill in as prices arrive.
-LOG_FIELDS = ["last_bar", "ticker", "agent", "action", "confidence", "approved",
-              "event", "close", "size_pct", "stop_loss", "take_profit"] + FWD_FIELDS +              ["reject_reason", "trend", "model", "run_utc", "rationale"]
+LOG_FIELDS = (["last_bar", "ticker", "agent", "action", "confidence", "approved",
+               "event", "close", "size_pct", "stop_loss", "take_profit"] + FWD_FIELDS +
+              ["reject_reason", "trend", "model", "run_utc", "rationale",
+               "data_source"])          # appended last: columns A-T keep their letters in the Sheet
 LOG_KEY = ("last_bar", "ticker", "agent")
 TRADE_FIELDS = ["ticker", "entry_date", "entry_price", "exit_date", "exit_price",
                 "pnl_pct", "reason", "model"]
+# One row per run: makes data gaps and source switches visible after the fact.
+RUN_FIELDS = ["run_utc", "trigger", "mode", "model", "size_policy", "analysed", "skipped",
+              "failed", "newest_bar", "expected_bar", "days_behind", "sources"]
 
 
 def scrub(text: str) -> str:
@@ -103,6 +110,7 @@ class Candidate:
     decision:   AgentDecision
     chart_path: str
     rule_decision: Optional[AgentDecision] = None   # free baseline, logged alongside the AI
+    data_source: str = ""                            # yfinance / alphavantage / cache / synthetic
 
 
 # ── data / analysis ──────────────────────────────────────────────────────────
@@ -117,18 +125,44 @@ def drop_partial_bar(full: pd.DataFrame, now_utc: datetime) -> pd.DataFrame:
     return full
 
 
+def expected_last_bar(now_utc: datetime) -> date:
+    """Date of the newest US trading day whose close should already be published: today on a
+    weekday after 16:30 ET, otherwise the previous weekday. Market holidays are not modelled,
+    so a holiday shows up as 'one day behind' (the message says so)."""
+    now_et = now_utc.astimezone(ET)
+    d = now_et.date()
+    if not (now_et.weekday() < 5 and now_et.time() >= time(16, 30)):
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def days_behind(newest: date, expected: date) -> int:
+    """Whole trading days (Mon-Fri) that the newest bar lags the expected one; 0 if current."""
+    if newest >= expected:
+        return 0
+    return int(np.busday_count(newest, expected))
+
+
 def analyse_ticker(ticker: str, cfg: AgentConfig, agent: ChartReadingAgent,
                    state: LiveState, now_utc: datetime, force: bool = False,
                    rule_agent: Optional[ChartReadingAgent] = None,
-                   series_out: Optional[Dict[str, pd.Series]] = None) -> Optional[Candidate]:
+                   series_out: Optional[Dict[str, pd.Series]] = None,
+                   source_out: Optional[Dict[str, str]] = None) -> Optional[Candidate]:
     """Returns a Candidate, or None when there is no new bar since the last run.
 
     rule_agent: when given (AI mode), the free rule-based decision for the same bar is
                 computed too, so both decision-makers are judged on identical days.
     series_out: receives the asset's closing prices (used later to fill in outcomes,
-                including for assets that have no new bar today)."""
+                including for assets that have no new bar today).
+    source_out: receives where the prices came from (yfinance / alphavantage / ...)."""
     fetcher = DataFetcher(cfg)
-    full = drop_partial_bar(fetcher.fetch(ticker), now_utc)
+    raw = fetcher.fetch(ticker)
+    source = fetcher.last_source          # read now: fetch_window() below re-reads the cache
+    if source_out is not None:
+        source_out[ticker] = source
+    full = drop_partial_bar(raw, now_utc)
     if full.empty:
         raise ValueError("no price data returned")
     if series_out is not None:
@@ -157,7 +191,7 @@ def analyse_ticker(ticker: str, cfg: AgentConfig, agent: ChartReadingAgent,
         rule_decision = rule_agent.analyze(
             image_b64, ToolExecutor(window, ticker, as_of, cfg), ticker, as_of)
     return Candidate(ticker, last_bar, float(window["Close"].iloc[-1]), decision,
-                     chart_path, rule_decision)
+                     chart_path, rule_decision, source)
 
 
 # ── portfolio logic (pure: easy to test) ─────────────────────────────────────
@@ -230,7 +264,7 @@ def process(candidates: List[Candidate], state: LiveState, risk: RiskFilter,
             "reject_reason": sig.reject_reason, "event": event,
             "size_pct": round(sig.size_pct, 4), "stop_loss": round(sig.stop_loss, 4),
             "take_profit": round(sig.take_profit, 4) if sig.take_profit else "",
-            "trend": d.trend, "model": mdl,
+            "trend": d.trend, "model": mdl, "data_source": c.data_source,
             "rationale": " ".join((d.rationale or "").split())}
 
     for c in candidates:                                   # 3) full audit log
@@ -263,7 +297,7 @@ def _short(text: str, n: int = 280) -> str:
 
 
 def format_digest(events, rows, skipped, failures, state, closes, mode_label,
-                  persist: bool) -> str:
+                  persist: bool, lag_note: str = "") -> str:
     esc = html.escape
     rows = primary_rows(rows)
     bars = sorted({r["last_bar"] for r in rows})
@@ -271,6 +305,8 @@ def format_digest(events, rows, skipped, failures, state, closes, mode_label,
             else "📊 <b>Daily signals</b>")
     out = [("🧪 <b>TEST RUN — not saved</b>\n" if not persist else "") + head,
            f"<i>{esc(mode_label)}</i>", ""]
+    if lag_note:                      # data is behind: say so before anything else
+        out[2:2] = ["⚠️ <b>" + esc(lag_note) + "</b>"]
 
     for e in events:
         if e["kind"] == "OPEN":
@@ -376,11 +412,13 @@ def update_log(path: str, new_rows: List[dict],
 
 
 def persist(out_dir: str, state: LiveState, rows, closed,
-            series: Optional[Dict[str, pd.Series]] = None) -> None:
+            series: Optional[Dict[str, pd.Series]] = None,
+            run_row: Optional[dict] = None) -> None:
     os.makedirs(out_dir, exist_ok=True)
     state.save(os.path.join(out_dir, "state.json"))
     update_log(os.path.join(out_dir, "signals_log.csv"), rows, series)
     _append_csv(os.path.join(out_dir, "paper_trades.csv"), TRADE_FIELDS, closed)
+    _append_csv(os.path.join(out_dir, "runs_log.csv"), RUN_FIELDS, [run_row] if run_row else [])
 
 
 # ── orchestration ────────────────────────────────────────────────────────────
@@ -392,11 +430,15 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
     if ai and not args.synthetic and not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY (your OpenRouter key) is not set for AI mode")
 
+    size_arg = str(getattr(args, "size_pct", "0.05")).strip().lower()
+    fixed_size = None if size_arg in ("agent", "none", "") else float(size_arg)
+
     cfg = AgentConfig(
         tickers=tickers,
         start_date=(now_utc - timedelta(days=420)).strftime("%Y-%m-%d"),
         end_date=(now_utc + timedelta(days=1)).strftime("%Y-%m-%d"),   # yfinance end is exclusive
         use_mock_llm=not ai, use_synthetic=args.synthetic, agent_model=args.model,
+        fixed_size_pct=fixed_size,          # same size for AI and rule: a fair comparison
         cache_dir="./data/cache_live", chart_dir="./data/charts_live")
     state = LiveState.load(os.path.join(args.out_dir, "state.json"))
     agent, risk = ChartReadingAgent(cfg), RiskFilter(cfg)
@@ -404,12 +446,14 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
     # both decision-makers can be compared on identical days (forward test).
     rule_agent = ChartReadingAgent(replace(cfg, use_mock_llm=True)) if ai else None
     series: Dict[str, pd.Series] = {}
+    sources: Dict[str, str] = {}
 
     candidates, skipped, failures = [], [], {}
     for t in tickers:
         try:
             c = analyse_ticker(t, cfg, agent, state, now_utc, force=args.force,
-                               rule_agent=rule_agent, series_out=series)
+                               rule_agent=rule_agent, series_out=series,
+                               source_out=sources)
             (skipped.append(t) if c is None else candidates.append(c))
         except Exception as exc:                           # one asset must not kill the run
             failures[t] = scrub(f"{type(exc).__name__}: {exc}")[:200]
@@ -421,14 +465,42 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
                                    agent="ai" if ai else "rule")
     for c in candidates:
         state.last_bar[c.ticker] = c.last_bar
+    # Is the price data current? (Yahoo has returned bars a day late on some nights.)
+    expected = expected_last_bar(now_utc)
+    behind = {t: days_behind(ser.index[-1].date(), expected) for t, ser in series.items()}
+    lagging = {t: n for t, n in behind.items() if n >= 1}
+    lag_note = ""
+    if lagging:
+        n = max(lagging.values())
+        who = (f"all {len(series)} assets" if len(lagging) == len(series)
+               else ", ".join(sorted(lagging)))
+        oldest = min(series[t].index[-1].date() for t in lagging)
+        lag_note = (f"Price data is {n} trading day{'s' if n > 1 else ''} behind for {who} "
+                    f"(data delay or a market holiday). Newest bar {oldest:%d %b}, "
+                    f"expected {expected:%d %b}.")
+
+    run_row = {
+        "run_utc": run_utc, "trigger": os.environ.get("GITHUB_EVENT_NAME", "manual"),
+        "mode": args.mode, "model": args.model if ai else "rule-based",
+        "size_policy": "agent" if fixed_size is None else f"fixed {fixed_size:.0%}",
+        "analysed": len(candidates), "skipped": len(skipped), "failed": len(failures),
+        "newest_bar": max((x.index[-1].strftime("%Y-%m-%d") for x in series.values()), default=""),
+        "expected_bar": expected.strftime("%Y-%m-%d"),
+        "days_behind": max(behind.values(), default=0),
+        "sources": ", ".join(f"{k}:{v}" for k, v in sorted(Counter(sources.values()).items()))}
+
     do_persist = not args.no_persist
     if do_persist:
-        persist(args.out_dir, state, rows, closed, series)
+        persist(args.out_dir, state, rows, closed, series, run_row)
 
     label = f"AI · {args.model}" if ai else "rule-based EMA/RSI baseline"
     text = format_digest(events, rows, skipped, failures, state,
-                         {c.ticker: c.close for c in candidates}, label, do_persist)
-    notifier.send(text)
+                         {c.ticker: c.close for c in candidates}, label, do_persist,
+                         lag_note=lag_note)
+    if candidates or failures or lag_note:
+        notifier.send(text)
+    else:                      # e.g. the morning catch-up run when last night was complete
+        print("nothing new to report - no message sent")
     for e in events:                                       # chart for each new BUY
         if e["kind"] == "OPEN":
             try:
@@ -438,7 +510,8 @@ def run(args, notifier: TelegramNotifier, now_utc: Optional[datetime] = None) ->
                 print(f"  chart for {e['ticker']} not sent: {scrub(str(exc))}")
 
     print(f"done: {len(candidates)} analysed, {len(skipped)} skipped (no new bar), "
-          f"{len(failures)} failed, {len(events)} action(s)")
+          f"{len(failures)} failed, {len(events)} action(s); data sources: "
+          f"{run_row['sources'] or 'n/a'}; days behind: {run_row['days_behind']}")
     # Only a total failure is an error; partial failures are reported in the digest.
     return 1 if failures and not candidates and not skipped else 0
 
@@ -456,6 +529,9 @@ def main(argv=None) -> int:
     ap.add_argument("--no-persist", action="store_true", help="do not write state or logs")
     ap.add_argument("--force", action="store_true", help="ignore the 'no new bar' check")
     ap.add_argument("--synthetic", action="store_true", help="offline test data (no network)")
+    ap.add_argument("--size-pct", default=os.environ.get("LIVE_SIZE_PCT", "0.05"),
+                    help="position size used for EVERY trade by both agents (default 0.05); "
+                         "'agent' lets each agent propose its own size")
     args = ap.parse_args(argv)
 
     if os.environ.get("OPENAI_API_KEY"):

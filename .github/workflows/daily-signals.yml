@@ -5,6 +5,8 @@ name: Daily signals
 on:
   schedule:
     - cron: "0 22 * * 1-5"      # 22:00 UTC Mon-Fri: after the US close in both EST and EDT
+    - cron: "0 9 * * 1-6"       # 09:00 UTC Mon-Sat: catch-up before the US open, for a price bar
+                                # that was still missing from the data provider last night
   workflow_dispatch:            # the "Run workflow" button — defaults make it a safe TEST
     inputs:
       mode:
@@ -35,6 +37,7 @@ jobs:
       ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
       OPENAI_BASE_URL: https://openrouter.ai/api/v1
       LIVE_MODEL: ${{ vars.LIVE_MODEL || 'openai/gpt-4o-mini' }}
+      LIVE_SIZE_PCT: ${{ vars.LIVE_SIZE_PCT || '0.05' }}   # same size for the AI and the rule
       # Scheduled runs are always the real thing (AI, saved); manual runs follow the inputs.
       MODE: ${{ github.event_name == 'schedule' && 'ai' || inputs.mode }}
       PERSIST: ${{ github.event_name == 'schedule' && 'true' || inputs.persist }}

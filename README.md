@@ -117,7 +117,21 @@ closed paper trade to `paper_trades.csv` on the `live-data` branch. That log is 
 
 **Test it:** Actions -> *Daily signals* -> *Run workflow*. The defaults are a safe test
 (free rule-based mode, marked "TEST RUN", nothing saved). Choose `ai` to test the LLM.
-Optional repository variable `LIVE_MODEL` changes the model (default `openai/gpt-4o-mini`).
+Optional repository variables: `LIVE_MODEL` changes the model (default `openai/gpt-4o-mini`),
+`LIVE_SIZE_PCT` changes the position size (default `0.05`).
+
+**Same position size for both agents.** Every trade, by the AI and by the rule alike, uses
+one size (5% by default, `fixed_size_pct` in `config.py`). Position size is then a portfolio
+policy and not part of either agent's judgment, so an AI-versus-rule comparison measures
+the BUY/SELL/HOLD decisions only. Set it to `agent` to let each agent propose its own size.
+
+**Late price data.** Yahoo has returned the latest daily bar a day late on some nights, and
+the job only analyses the newest bar. A second run at 09:00 UTC (Mon-Sat, before the US
+open) catches a bar that was missing the night before. The message says so when prices are
+behind ("Price data is N trading days behind ...", which also appears on market holidays),
+`runs_log.csv` records every run (data source, newest bar, expected bar, days behind), and
+each log row has a `data_source` column. If nothing is new, the morning run sends no message.
+Decisions for days no run could see (for example 14 Oct 2026) are simply absent from the log.
 
 **Locally** (prints instead of sending): `python -m llm_trader.live.daily --mode rule --dry-run`
 
