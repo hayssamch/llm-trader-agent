@@ -146,11 +146,16 @@ is what lets you assess a past decision. Read it as "what the market did next", 
 backtested trade result (see `paper_trades.csv` for closed paper trades).
 
 A second tab (`Review`) with a start date in `B1` and an end date in `B2` can then compute,
-per asset and agent, how BUY recommendations fared (column M = 5-day, O = 20-day):
+per asset and agent, how BUY recommendations fared (5-day outcome in column M, 20-day in O).
+Filter by date with `FILTER` first and aggregate with `QUERY` after: IMPORTDATA delivers the
+dates as plain numbers, and a `QUERY` condition such as `A >= date '2026-10-13'` then silently
+matches nothing.
 
 ```
-=QUERY(Log!A:T, "select B, C, count(D), avg(M), avg(O) where D = 'BUY' and M is not null and A >= date '"&TEXT($B$1,"yyyy-mm-dd")&"' and A <= date '"&TEXT($B$2,"yyyy-mm-dd")&"' group by B, C order by B, C label count(D) 'BUYs', avg(M) 'avg 5d %', avg(O) 'avg 20d %'", 1)
+=IFERROR(QUERY(FILTER(Log!A:T,Log!A:A>=$B$1,Log!A:A<=$B$2,Log!D:D="BUY",Log!M:M<>""),"select Col2, Col3, count(Col4), avg(Col13), avg(Col15) group by Col2, Col3 order by Col2, Col3 label Col2 'Ticker', Col3 'Agent', count(Col4) 'BUYs', avg(Col13) 'Avg 5-day move %', avg(Col15) 'Avg 20-day move %'",0),"No BUY with a 5-day outcome in this period yet.")
 ```
+
+(Verified against an independent calculation on the live log, using the 1-day column.)
 
 Always compare against the benchmark: the average `fwd_5d` of **all** `agent = ai` rows in
 the same period is what a random pick would have earned. A BUY average only means something
