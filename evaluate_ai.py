@@ -24,6 +24,7 @@ Requires an OpenRouter key in the environment (never hard-code it):
     python evaluate_ai.py
 
 Set EVAL_REPEATS=2 (or more) to repeat the AI run and measure run-to-run variance.
+Set EVAL_ASSETS=NVDA,JPM to run a subset and EVAL_OUT=name.csv to choose the output file.
 
 Cost warning: one LLM call per trading day per asset (~145 per asset for the
 default window). Keep ASSETS short. openai/gpt-4o-mini is the cheap option.
@@ -46,6 +47,9 @@ FIXED_SIZE = 0.05        # both agents trade this size, so only the decisions di
 START, END = "2025-10-01", "2026-07-28"
 MODEL  = os.environ.get("EVAL_MODEL", "openai/gpt-4o-mini")
 ASSETS = {"AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "Nvidia", "JPM": "JPMorgan"}
+if os.environ.get("EVAL_ASSETS"):                       # e.g. EVAL_ASSETS=NVDA,JPM
+    ASSETS = {t: ASSETS.get(t, t) for t in os.environ["EVAL_ASSETS"].split(",")}
+OUT_CSV = os.environ.get("EVAL_OUT", "ai_comparison_results.csv")
 REPEATS = int(os.environ.get("EVAL_REPEATS", "1"))   # >1 repeats the AI run to measure variance
 
 if not os.environ.get("OPENAI_API_KEY"):
