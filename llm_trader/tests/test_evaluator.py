@@ -90,3 +90,19 @@ def test_summarise_with_no_trades_is_safe():
     assert s["Avg trade % (net)"] == 0.0
     assert pd.isna(s["Trade edge (pts)"])
     assert s["B&H matched %"] == pytest.approx(0.0)
+
+
+def test_real_data_shape_tz_aware_bars_and_string_trade_dates():
+    """Yahoo bars are tz-aware (UTC); the engine records trade dates as 'YYYY-MM-DD' strings."""
+    days = pd.bdate_range("2026-01-01", periods=20, tz="UTC")
+    ec = pd.Series(100_000.0, index=days)
+    price = pd.Series(100.0, index=days)
+    tr = {"ticker": "T", "entry_date": days[0].strftime("%Y-%m-%d"),
+          "exit_date": days[5].strftime("%Y-%m-%d"), "entry_price": 100.0,
+          "exit_price": 103.0, "shares": 100.0, "pnl_pct": 0.03, "reason": "signal"}
+    r = BacktestResult(AgentConfig(), "T", ec, trades=[tr])
+    ev = Evaluator()
+    assert ev.exposure(r) == pytest.approx(0.10 * 5 / 20)
+    assert ev.avg_hold_days(r) == pytest.approx(5.0)
+    s = ev.summarise(r, price, "T")
+    assert s["Trades"] == 1 and s["Exposure %"] == pytest.approx(2.5)

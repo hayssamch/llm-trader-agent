@@ -15,6 +15,22 @@ from llm_trader.backtest.engine import BacktestResult
 logger = logging.getLogger(__name__)
 
 
+def _bar_dates(index) -> pd.DatetimeIndex:
+    """Calendar date of each bar, timezone dropped. Market data arrives tz-aware (UTC) while
+    the engine records trade dates as 'YYYY-MM-DD' strings taken from the same calendar date."""
+    idx = pd.DatetimeIndex(index)
+    if idx.tz is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize()
+
+
+def _trade_date(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+    return ts.normalize()
+
+
 @dataclass
 class Metrics:
     label:            str
@@ -68,11 +84,11 @@ class Evaluator:
         if len(ec) == 0 or not trades:
             return 0.0
         capital = result.config.initial_capital
-        idx = pd.DatetimeIndex(ec.index)
-        invested = pd.Series(0.0, index=idx)
+        idx = _bar_dates(ec.index)
+        invested = np.zeros(len(idx))
         for t in trades:
             notional = t["shares"] * t["entry_price"] / capital
-            held = (idx >= pd.Timestamp(t["entry_date"])) & (idx < pd.Timestamp(t["exit_date"]))
+            held = (idx >= _trade_date(t["entry_date"])) & (idx < _trade_date(t["exit_date"]))
             invested[held] += notional
         return float(invested.mean())
 
@@ -81,9 +97,9 @@ class Evaluator:
         ec, trades = result.equity_curve, result.trades
         if not trades:
             return 0.0
-        idx = pd.DatetimeIndex(ec.index)
-        days = [int(((idx >= pd.Timestamp(t["entry_date"])) &
-                     (idx < pd.Timestamp(t["exit_date"]))).sum()) for t in trades]
+        idx = _bar_dates(ec.index)
+        days = [int(((idx >= _trade_date(t["entry_date"])) &
+                     (idx < _trade_date(t["exit_date"]))).sum()) for t in trades]
         return float(np.mean(days))
 
     def entry_benchmark(self, price: pd.Series, hold_days: float) -> float:
