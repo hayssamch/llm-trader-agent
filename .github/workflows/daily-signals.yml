@@ -38,8 +38,10 @@ jobs:
       OPENAI_BASE_URL: https://openrouter.ai/api/v1
       LIVE_MODEL: ${{ vars.LIVE_MODEL || 'openai/gpt-4o-mini' }}
       LIVE_SIZE_PCT: ${{ vars.LIVE_SIZE_PCT || '0.05' }}   # same size for the AI and the rule
-      # Scheduled runs are always the real thing (AI, saved); manual runs follow the inputs.
-      MODE: ${{ github.event_name == 'schedule' && 'ai' || inputs.mode }}
+      # Scheduled runs are saved. Their mode comes from the repository variable LIVE_MODE
+      # (Settings > Secrets and variables > Actions > Variables): "rule" (free, the default) or
+      # "ai" (the LLM agent, which costs model credit). Manual runs follow the inputs.
+      MODE: ${{ github.event_name == 'schedule' && (vars.LIVE_MODE || 'rule') || inputs.mode }}
       PERSIST: ${{ github.event_name == 'schedule' && 'true' || inputs.persist }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -52,7 +54,9 @@ jobs:
             exit 0
           fi
           missing=""
-          for v in TELEGRAM_CHAT_ID OPENAI_API_KEY ALPHAVANTAGE_API_KEY; do
+          required="TELEGRAM_CHAT_ID ALPHAVANTAGE_API_KEY"
+          if [ "$MODE" = "ai" ]; then required="$required OPENAI_API_KEY"; fi   # the key is only needed for AI mode
+          for v in $required; do
             if [ -z "${!v}" ]; then missing="$missing $v"; fi
           done
           if [ -n "$missing" ]; then

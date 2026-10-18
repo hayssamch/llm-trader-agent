@@ -117,8 +117,11 @@ closed paper trade to `paper_trades.csv` on the `live-data` branch. That log is 
 
 **Test it:** Actions -> *Daily signals* -> *Run workflow*. The defaults are a safe test
 (free rule-based mode, marked "TEST RUN", nothing saved). Choose `ai` to test the LLM.
-Optional repository variables: `LIVE_MODEL` changes the model (default `openai/gpt-4o-mini`),
-`LIVE_SIZE_PCT` changes the position size (default `0.05`).
+Optional repository variables: `LIVE_MODE` sets what the **scheduled** run uses
+(`rule` = free EMA/RSI baseline, the default; `ai` = the LLM agent, which costs model credit
+and needs `OPENAI_API_KEY`), `LIVE_MODEL` changes the model (default `openai/gpt-4o-mini`),
+`LIVE_SIZE_PCT` changes the position size (default `0.05`). To switch the daily job back to the
+AI, set `LIVE_MODE` to `ai`; no code change is needed.
 
 **Same position size for both agents.** Every trade, by the AI and by the rule alike, uses
 one size (5% by default, `fixed_size_pct` in `config.py`). Position size is then a portfolio
