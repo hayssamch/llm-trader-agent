@@ -52,10 +52,81 @@ class Evaluator:
         return m
 
     def buy_and_hold(self, price: pd.Series, capital: float,
-                     label: str = "Buy-and-Hold") -> Metrics:
-        ec = price / price.iloc[0] * capital
+                     label: str = "Buy-and-Hold", exposure: float = 1.0) -> Metrics:
+        """Hold the asset with `exposure` of capital (1.0 = fully invested), the rest in
+        cash at 0%. An exposure below 1 gives the benchmark a like-for-like capital
+        deployment when the strategy is only invested part of the time."""
+        ec = capital * (1.0 + exposure * (price / price.iloc[0] - 1.0))
         dummy = type("R", (), {"equity_curve": ec, "trades": []})()
         return self.evaluate(dummy, label=label)
+
+    # ── size-independent comparison helpers ──────────────────────────────────
+    def exposure(self, result: BacktestResult) -> float:
+        """Average fraction of initial capital invested, over every bar of the equity
+        curve (days spent flat count as zero). Entry notional is shares x entry price."""
+        ec, trades = result.equity_curve, result.trades
+        if len(ec) == 0 or not trades:
+            return 0.0
+        capital = result.config.initial_capital
+        idx = pd.DatetimeIndex(ec.index)
+        invested = pd.Series(0.0, index=idx)
+        for t in trades:
+            notional = t["shares"] * t["entry_price"] / capital
+            held = (idx >= pd.Timestamp(t["entry_date"])) & (idx < pd.Timestamp(t["exit_date"]))
+            invested[held] += notional
+        return float(invested.mean())
+
+    def avg_hold_days(self, result: BacktestResult) -> float:
+        """Average holding period of a closed trade, in bars of the equity curve."""
+        ec, trades = result.equity_curve, result.trades
+        if not trades:
+            return 0.0
+        idx = pd.DatetimeIndex(ec.index)
+        days = [int(((idx >= pd.Timestamp(t["entry_date"])) &
+                     (idx < pd.Timestamp(t["exit_date"]))).sum()) for t in trades]
+        return float(np.mean(days))
+
+    def entry_benchmark(self, price: pd.Series, hold_days: float) -> float:
+        """Average return of entering on ANY bar and holding `hold_days` bars (percent).
+        The like-for-like yardstick for the average trade: it removes market drift and
+        trade length from the comparison."""
+        h = int(round(hold_days))
+        if h < 1 or len(price) <= h:
+            return float("nan")
+        fwd = price.shift(-h) / price - 1.0
+        return float(fwd.dropna().mean() * 100)
+
+    def summarise(self, result: BacktestResult, price: pd.Series, label: str) -> Dict:
+        """One row of the thesis results table: strategy, full buy-and-hold, exposure-matched
+        buy-and-hold, and the per-trade metrics that do not depend on position size."""
+        m = self.evaluate(result, label=label)
+        capital = result.config.initial_capital
+        p = price.loc[result.equity_curve.index[0]:result.equity_curve.index[-1]]
+        expo = self.exposure(result)
+        full = self.buy_and_hold(p, capital)
+        matched = self.buy_and_hold(p, capital, exposure=expo)
+        hold = self.avg_hold_days(result)
+        bench = self.entry_benchmark(p, hold) if m.n_trades else float("nan")
+        cost = 2 * result.config.commission_pct * 100          # round-trip commission, in %
+        net_avg = m.avg_trade_pct - cost if m.n_trades else 0.0
+        return {
+            "Return %": m.total_return_pct,
+            "B&H full %": full.total_return_pct,
+            "Exposure %": expo * 100,
+            "B&H matched %": matched.total_return_pct,
+            "Excess vs matched": m.total_return_pct - matched.total_return_pct,
+            "MaxDD %": m.max_drawdown_pct,
+            "B&H matched DD %": matched.max_drawdown_pct,
+            "Trades": m.n_trades,
+            "Win %": m.win_rate_pct,
+            "Avg trade % (net)": net_avg,
+            "Median trade %": float(np.median([t["pnl_pct"] for t in result.trades]) * 100)
+                              if result.trades else 0.0,
+            "Avg hold (days)": hold,
+            "Any-entry same-hold %": bench,
+            "Trade edge (pts)": (net_avg - bench) if m.n_trades and not np.isnan(bench)
+                                else float("nan"),
+        }
 
     def comparison_table(self, metrics: List[Metrics]) -> pd.DataFrame:
         rows = {

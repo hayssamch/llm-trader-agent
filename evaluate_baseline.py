@@ -1,9 +1,15 @@
 """
 Multi-asset baseline evaluation — rule-based agent on real data.
 
-Runs the identical backtest across the asset universe and prints a comparison
-table (strategy vs buy-and-hold) plus run-health diagnostics, so any zero-trade
-result can be explained rather than guessed at.
+Runs the identical backtest across the asset universe and prints two tables:
+
+  * equity, compared with an EXPOSURE-MATCHED buy-and-hold (the same average capital
+    held in the asset), because a fixed-size, long-only strategy is invested only a
+    fraction of the time and a fully invested buy-and-hold is not a like-for-like yardstick;
+  * per-trade metrics that do not depend on position size, with the average trade compared
+    with entering on any day and holding for the same length of time.
+
+Run-health diagnostics are printed so a zero-trade result is explained, not guessed at.
 
     PYTHONPATH=. python evaluate_baseline.py
 """
@@ -46,28 +52,16 @@ for ticker, name in ASSETS.items():
         engine = BacktestEngine(cfg)
         result = engine.run(ticker)
         ev = Evaluator()
-        strat = ev.evaluate(result, label=ticker)
         price = engine.fetcher.fetch(ticker).loc[START:END, "Close"]
-        bnh = ev.buy_and_hold(price, cfg.initial_capital)
-
-        rows.append({
-            "Asset": f"{name} ({ticker})",
-            "Strat ret %": round(strat.total_return_pct, 2),
-            "B&H ret %": round(bnh.total_return_pct, 2),
-            "Excess %": round(strat.total_return_pct - bnh.total_return_pct, 2),
-            "Strat maxDD %": round(strat.max_drawdown_pct, 2),
-            "B&H maxDD %": round(bnh.max_drawdown_pct, 2),
-            "Win %": round(strat.win_rate_pct, 1),
-            "Avg trade %": round(strat.avg_trade_pct, 2),
-            "Trades": strat.n_trades,
-        })
+        row = {"Asset": ticker, **ev.summarise(result, price, label=ticker)}
+        rows.append(row)
         health.append({
             "Asset": ticker, "approved": len(result.signals),
             "rejected": len(result.rejected), "errors": len(result.errors),
             "warmup": result.n_warmup, "bars": len(result.equity_curve),
         })
-        print(f"  done {ticker}: {strat.n_trades} trades, "
-              f"{strat.total_return_pct:+.2f}% vs B&H {bnh.total_return_pct:+.2f}%")
+        print(f"  done {ticker}: {row['Trades']} trades, {row['Return %']:+.2f}% "
+              f"(exposure {row['Exposure %']:.1f}%, matched B&H {row['B&H matched %']:+.2f}%)")
     except Exception as exc:
         print(f"  FAILED {ticker}: {exc}")
         health.append({"Asset": ticker, "approved": "-", "rejected": "-",
@@ -77,22 +71,28 @@ df = pd.DataFrame(rows)
 hf = pd.DataFrame(health)
 
 print("\n" + "=" * 100)
-print(f" BASELINE (rule-based agent, real data)   {START} -> {END}")
+print(f" BASELINE (rule-based agent, real data, {FIXED_SIZE:.0%} per trade)   {START} -> {END}")
 print("=" * 100)
-print(df.to_string(index=False))
+
+if rows:
+    d = df.round(2)
+    print("\n EQUITY, EXPOSURE-MATCHED (B&H matched holds the same average capital in the asset)")
+    print(d[["Asset", "Return %", "Exposure %", "B&H matched %", "Excess vs matched",
+             "B&H full %", "MaxDD %", "B&H matched DD %"]].to_string(index=False))
+    print("\n PER TRADE (independent of position size; net of round-trip commission)")
+    print(d[["Asset", "Trades", "Win %", "Avg trade % (net)", "Median trade %",
+             "Avg hold (days)", "Any-entry same-hold %", "Trade edge (pts)"]].to_string(index=False))
 
 print("\n RUN HEALTH (verifies results are real, not silent failures)")
 print(hf.to_string(index=False))
 
 if rows:
     print("\n AGGREGATE")
-    print(f"   mean strategy return : {df['Strat ret %'].mean():+.2f}%")
-    print(f"   mean buy&hold return : {df['B&H ret %'].mean():+.2f}%")
-    print(f"   mean excess          : {df['Excess %'].mean():+.2f}%")
-    print(f"   mean strategy maxDD  : {df['Strat maxDD %'].mean():.2f}%")
-    print(f"   mean buy&hold maxDD  : {df['B&H maxDD %'].mean():.2f}%")
-    print(f"   assets beating B&H   : {(df['Excess %'] > 0).sum()} / {len(df)}")
-    print(f"   total trades         : {df['Trades'].sum()}")
+    print(f"   mean exposure          : {df['Exposure %'].mean():.1f}%")
+    print(f"   mean excess vs matched : {df['Excess vs matched'].mean():+.2f} pts")
+    print(f"   assets beating matched : {(df['Excess vs matched'] > 0).sum()} / {len(df)}")
+    print(f"   mean trade edge        : {df['Trade edge (pts)'].mean():+.2f} pts")
+    print(f"   total trades           : {int(df['Trades'].sum())}")
 
 df.to_csv("baseline_results.csv", index=False)
 print("\n saved -> baseline_results.csv")
