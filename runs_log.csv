@@ -1,0 +1,2 @@
+run_utc,trigger,mode,model,size_policy,analysed,skipped,failed,newest_bar,expected_bar,days_behind,sources
+2026-10-19T16:20:42Z,schedule,rule,rule-based,fixed 5%,11,0,0,2026-10-16,2026-10-16,0,yfinance:11
