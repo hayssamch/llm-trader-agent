@@ -2,3 +2,4 @@ run_utc,trigger,mode,model,size_policy,analysed,skipped,failed,newest_bar,expect
 2026-10-19T16:20:42Z,schedule,rule,rule-based,fixed 5%,11,0,0,2026-10-16,2026-10-16,0,yfinance:11
 2026-10-20T00:46:41Z,schedule,rule,rule-based,fixed 5%,0,11,0,2026-10-16,2026-10-19,1,yfinance:11
 2026-10-20T14:12:54Z,schedule,rule,rule-based,fixed 5%,11,0,0,2026-10-19,2026-10-19,0,yfinance:11
+2026-10-21T00:13:47Z,schedule,rule,rule-based,fixed 5%,0,11,0,2026-10-19,2026-10-20,1,yfinance:11
